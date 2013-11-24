@@ -21,6 +21,7 @@ var BOX_PAGE_SIZE = 20;
 
 var REGEX_TOKEN = /^[a-z0-9][a-z0-9][a-z0-9]+$/;
 var REGEX_EMAIL = /^([A-Z0-9._%+-=]+)@([A-Z0-9.-]+\.[A-Z]{2,4})$/i;
+var REGEX_BODY = /^Subject: (.*)(?:\r?\n)+([\s\S]*)$/i;
 var REGEX_CONTACT_NAME = /^[^@]*$/i;
 
 var SCRYPT_PARAMS = {
@@ -80,7 +81,7 @@ viewState.getLastEmail = function() {
     if (!this.emails) {
         return null;
     }
-    return createEmailViewModel(this.emails[this.emails.length-1]);
+    return this.emails[this.emails.length-1];
 }
 // Returns the last email from another user.
 viewState.getLastEmailFromAnother = function() {
@@ -89,8 +90,8 @@ viewState.getLastEmailFromAnother = function() {
     }
     for (var i=this.emails.length-1; 0 <= i; i--) {
         var email = this.emails[i];
-        if (trimToLower(email.From) != sessionStorage["emailAddress"]) {
-            return createEmailViewModel(email);
+        if (trimToLower(email.from) != sessionStorage["emailAddress"]) {
+            return email;
         }
     }
     // just return the last email even from self.
@@ -628,9 +629,9 @@ function decryptSubject(h) {
 }
 
 function prefetchAndDecryptThread(h){
-    cachedLoadEmail({msgID:h.MessageID, threadID:h.ThreadID}, function(emailDatas) {
-        console.log("Prefetched thread, # emails: "+emailDatas.length);
-        startDecryptEmailThread(emailDatas); 
+    cachedLoadThread({msgID:h.MessageID, threadID:h.ThreadID}, function(emails) {
+        console.log("Prefetched thread, # emails: "+emails.length);
+        decryptEmailThread(emails); 
     });
 }
 
@@ -697,6 +698,24 @@ function bindEmailEvents() {
     $(".threadControl .deleteButton").click(withLastEmail(function(email){emailMove(email, "trash", true)}));
 }
 
+// plaintextBody is of the form:
+// ```
+// Subject: <subject line>
+//
+// <body lines...>
+// ```
+//
+// Returns {subject:<subject line>, body:<body...>, ok:<boolean>}
+function parseBody(plaintextBody) {
+    var parts = REGEX_BODY.exec(plaintextBody);
+    if (parts == null) {
+        // for legacy emails
+        return {subject:"(Unknown subject)", body:plaintextBody, ok:false};
+    } else {
+        return {subject:parts[1], body:parts[2], ok:true};
+    }
+}
+
 function addContact() {
     var addr = $(this).data("addr");
     var name = prompt("Contact name for "+addr);
@@ -759,21 +778,26 @@ function displayEmail(emailHeader) {
         msgID: msgID,
         threadID: threadID,
     };
-    cachedLoadEmail(params, function(emailDatas) {
-        viewState.emails = emailDatas;
+    cachedLoadThread(params, function(emails) {
+        // Construct view modls
+        viewState.emails = emails;
 
         // Construct thread element, show placeholders.
-        showEmailThread(emailDatas);
+        showEmailThread(emails);
         // Reply, Fwd buttons, etc
         bindEmailEvents();
         // Start decoding. Actual messages appear when this is done.
-        startDecryptEmailThread(emailDatas);
+        decryptEmailThread(emails, function() {
+            emails.forEach(function(email) {
+                $("#body-"+bin2hex(email.msgID)).text(email.plainBody);
+            });
+        });
     });
 }
 
-function startDecryptEmailThread(emailDatas){
+function decryptEmailThread(emails, cb){
     // Asynchronously verify+decrypt
-    var fromAddrs = emailDatas.map("From").map(trimToLower).unique();
+    var fromAddrs = emails.map("from").map(trimToLower).unique();
     lookupPublicKeys(fromAddrs, function(keyMap, newResolutions) {
         // First, save new pubHashes to contacts so future lookups are faster.
         if (newResolutions.length > 0) {
@@ -781,36 +805,52 @@ function startDecryptEmailThread(emailDatas){
         }
 
         // Start decrypt+verify on the web workers
-        emailDatas.forEach(function(emailData) {
-            decryptAndVerifyEmail(emailData, keyMap);
-        });
+        async.each(emails,
+            // iterator
+            function(email, done) {
+                decryptAndVerifyEmail(email, keyMap, function(email) { done() });
+            },
+            // on complete
+            function(err) {
+                if (cb) {
+                    cb();
+                }
+            }
+        );
     });
 }
 
-function cachedLoadEmail(params, cb){
-    if(cache.emailCache.hasOwnProperty(params.msgID)){
+function cachedLoadThread(params, cb){
+    if(cache.emailCache.hasOwnProperty(params.threadID)){
         // NOTE: we may want to use params.box in the future.
-        cb(cache.emailCache[params.msgID]);
+        cb(cache.emailCache[params.threadID]);
     } else {
-        $.get(HOST_PREFIX+"/email/", params, function(emailData) {
-            cache.emailCache[params.msgID] = emailData;
-            cb(emailData);
+        $.get(HOST_PREFIX+"/email/", params, function(emailDatas) {
+            var emails = emailDatas.map(createEmailViewModel);
+            cache.emailCache[params.threadID] = emails;
+            cb(emails);
         }, "json");
     }
 }
 
 // Decrypts an email. Checks the signature, if there is one.
-// Expects data.CipherBody, sets data.plaintextBody
-function decryptAndVerifyEmail(data, keyMap) {
-    var from = trimToLower(data.From);
+// Sets email.plainSubject and .plainBody.
+function decryptAndVerifyEmail(email, keyMap, cb) {
+    var from = email.from;
     var fromKey = keyMap[from].pubKeyArmor;
     if (!fromKey) {
         // TODO: color code to show that the email is unverified
         console.log("No key found for "+from+". This email is unverifiable "+
             "regardless of whether it has a signature.");
     }
-    cachedDecryptPgp(data.MessageID+" body", data.CipherBody, fromKey, function(plain){
-        $("#body-"+bin2hex(data.MessageID)).text(plain);
+    cachedDecryptPgp(email.msgID+" body", email.cipherBody, fromKey, function(plain){
+        var parsedBody = parseBody(plain);
+        email.plainSubject = parsedBody.subject;
+        email.plainBody = parsedBody.body;
+        if (!parsedBody.ok) {
+            // TODO handle case where the body isn't the right format.
+        }
+        cb(email);
     });
 }
 
@@ -832,15 +872,15 @@ function createEmailViewModel(data) {
         to:            trimToLower(data.To),
         toAddresses:   toAddresses,
         hexMsgID:      bin2hex(data.MessageID),
-        cipherSubject: data.cipherSubject
-        // missing subject, htmlBody, plainBody
-        // those are decrypted asynchronously
+        cipherSubject: data.CipherSubject,
+        cipherBody:    data.CipherBody,
+        // following are decrypted asynchronously
+        plainSubject:  undefined,
+        plainBody:     undefined,
     };
 }
 
-function showEmailThread(emailDatas) {
-    // Construct view modls
-    var emails = emailDatas.map(createEmailViewModel);
+function showEmailThread(emails) {
     var tid = emails[emails.length-1].threadID;
     var subj = cache.plaintextCache[tid+" subject"]
     var thread = {
@@ -887,9 +927,7 @@ function createHyperlinks(text) {
 function emailReply(email) {
     if (!email) return;
     var replyTo = email.fromAddress.name || email.fromAddress.address;
-    cachedDecryptPgp(email.threadID + " subject", email.cipherSubject, null, function(subject){
-        displayComposeInline(email, replyTo, subject, undefined);
-    });
+    displayComposeInline(email, replyTo, email.plainSubject, undefined);
 }
 
 function emailReplyAll(email) {
@@ -909,12 +947,12 @@ function emailReplyAll(email) {
     var replyTo = allRecipientsExceptMe.map(function(addr) {
         return addr.name || addr.address;
     }).join(",");
-    displayComposeInline(email, replyTo, email.subject, undefined);
+    displayComposeInline(email, replyTo, email.plainSubject, undefined);
 }
 
 function emailForward(email) {
     if (!email) return;
-    displayComposeInline(email, "", email.subject, email.plainBody);
+    displayComposeInline(email, "", email.plainSubject, email.plainBody);
 }
 
 // email: the email object
@@ -923,7 +961,7 @@ function emailForward(email) {
 function emailMove(email, box, moveThread) {
     if (keepUnsavedWork()) { return; }
     // Do nothing if already moved.
-    if (email._movedThread || (email._moved && !moveThread)) {
+    if (email._movedToBox == box) {
         return;
     }
     // Confirm if deleting
@@ -935,8 +973,7 @@ function emailMove(email, box, moveThread) {
         }
     }
     // Disable buttons while moving
-    email._moved = true;
-    email._movedThread = moveThread;
+    email._movedToBox = box;
     var elEmail = getEmailElement(email.msgID);
     var elThread = elEmail.closest("#thread");
     if (moveThread) {
@@ -1410,6 +1447,10 @@ function sendEmailUnencrypted(msgID, threadID, ancestorIDs, to, subject, body, c
 
 function sendEmailPost(data, cb, failCb) {
     $.post(HOST_PREFIX+"/email/", data, function() {
+        // HACK, clear cached thread.
+        // Alternatively, we could just create a new email model object client-side
+        // and just inject it into the cache.
+        delete cache.emailCache[data.threadID];
         cb();
     }).fail(function(xhr) {
         failCb("Sending failed:\n"+xhr.responseText);
